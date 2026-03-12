@@ -9,9 +9,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from collections import OrderedDict
 
-from data_model import LibFile, LibBlock, ModelEntry, ParamEntry
+from data_model import LibFile, LibBlock, ModelEntry, ParamEntry, DirectiveEntry
 from lib_parser import parse_lib
 from lib_writer import save_lib, write_lib
+from excel_exporter import export_lib_to_excel
 
 # ─────────────────── 색상 & 폰트 상수 ────────────────────
 BG_DARK    = "#1e1e2e"
@@ -36,11 +37,15 @@ FONT_SMALL = ("Consolas", 10)
 
 # ──────────────────── 인라인 셀 편집기 ───────────────────
 class InlineCellEditor:
-    """Treeview 셀에 Entry 위젯을 올려서 인라인 편집을 구현합니다."""
+    """
+    Tkinter Treeview 안에서 Excel처럼 표의 셀을 직접 클릭해서 수정할 수 있게 해주는 헬퍼 클래스입니다.
+    선택된 셀 위치에 임시 `tk.Entry` 텍스트 박스 위젯을 겹쳐 올린 뒤, 
+    유저가 값 입력을 마치고 Enter/Tab을 누르면 원본 노드의 데이터를 갱신(commit)합니다.
+    """
 
     def __init__(self, tree: ttk.Treeview, on_commit):
         self.tree = tree
-        self.on_commit = on_commit  # (item_id, col_index, new_value) -> None
+        self.on_commit = on_commit  # 값이 확정되었을 때 호출할 콜백 (item_id, col_index, new_value) -> None
         self._entry = None
         self._item = None
         self._col = None
@@ -95,6 +100,11 @@ class InlineCellEditor:
 
 # ─────────────────── 메인 애플리케이션 ───────────────────
 class LibEditorApp(tk.Tk):
+    """
+    Tkinter로 작성된 Smart Spice .lib 에디터 메인 창 클래스입니다.
+    파일을 읽고 저장하는 전체 라이프사이클과 화면 분할, 트리뷰 기반 탐색 UI,
+    단축키 이벤트 처리 등을 관장합니다.
+    """
 
     def __init__(self):
         super().__init__()
@@ -208,6 +218,8 @@ class LibEditorApp(tk.Tk):
                    command=self._save_as_file).pack(side=tk.LEFT, padx=2, pady=4)
         ttk.Button(tb, text="👁  내용 미리보기", style="Toolbar.TButton",
                    command=self._preview).pack(side=tk.LEFT, padx=2, pady=4)
+        ttk.Button(tb, text="📊  Excel 내보내기", style="Toolbar.TButton",
+                   command=self._export_excel).pack(side=tk.LEFT, padx=2, pady=4)
 
         self._filepath_var = tk.StringVar(value="— 파일을 열어주세요 —")
         ttk.Label(tb, textvariable=self._filepath_var,
@@ -245,6 +257,11 @@ class LibEditorApp(tk.Tk):
         self.tree.pack(fill=tk.BOTH, expand=True)
         vsb.config(command=self.tree.yview)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
+        # 뷰 전환 리스트
+        ttk.Button(left, text="🔄  파라미터 중심 뷰 열기", style="Toolbar.TButton",
+                   command=self._open_param_view).pack(fill=tk.X, side=tk.BOTTOM, padx=4, pady=4)
 
         # ── 우측: 편집 패널 ──
         right = tk.Frame(pw, bg=BG_DARK)
@@ -302,8 +319,8 @@ class LibEditorApp(tk.Tk):
                    command=self._add_param).pack(side=tk.LEFT, padx=8)
         ttk.Button(btn_bar, text="－  삭제", style="Danger.TButton",
                    command=self._delete_param).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_bar, text="🔤  변수 → 값 설정", style="Toolbar.TButton",
-                   command=self._assign_variable).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_bar, text="📋  일괄 수정", style="Toolbar.TButton",
+                   command=self._batch_edit_param).pack(side=tk.LEFT, padx=4)
 
         # 변수(PARAM) 전용 하단 섹션
         self._var_frame = tk.Frame(right, bg=BG_DARK)
@@ -390,10 +407,15 @@ class LibEditorApp(tk.Tk):
         txt.insert("1.0", text)
         txt.configure(state="disabled")
 
-    # ── 트리 빌드 ─────────────────────────────────────────
+    # ── 트리 빌드 (GUI 갱신) ──────────────────────────────
     def _rebuild_tree(self):
+        """
+        메모리에 파싱된 `self.lib_file` 객체의 최신 데이터를 바탕으로
+        좌측 사이드바 트리뷰(Treeview)를 초기화하고 화면에 다시 그려줍니다.
+        전역 파라미터 -> 전역 설정 지시어 -> 각 LIB 블록 (파라미터 -> 지시어 -> 모델 순)으로 렌더링합니다.
+        """
         self.tree.delete(*self.tree.get_children())
-        self._node_map.clear()
+        self._node_map.clear()  # 트리 노드 ID와 실제 백엔드 데이터 객체 매핑 테이블 초기화
 
         if not self.lib_file:
             return
@@ -410,6 +432,18 @@ class LibEditorApp(tk.Tk):
                                          tags=("param_var",))
                 self._node_map[child] = ("global_param_var", pe)
 
+        # 전역 기타 directive
+        if self.lib_file.global_directives:
+            node = self.tree.insert("", "end",
+                                    text="📄 전역 설정 (.directives)",
+                                    open=True, tags=("directives",))
+            self._node_map[node] = ("global_directives", None)
+            for de in self.lib_file.global_directives:
+                child = self.tree.insert(node, "end",
+                                         text=f"  {de.raw_text}",
+                                         tags=("directive_var",))
+                self._node_map[child] = ("global_directive_var", de)
+
         # LIB 블록들
         for lb in self.lib_file.lib_blocks:
             lib_node = self.tree.insert("", "end",
@@ -424,6 +458,13 @@ class LibEditorApp(tk.Tk):
                                           tags=("params",))
                 self._node_map[p_node] = ("lib_params", lb)
 
+            # LIB 내 기타 directive
+            if lb.directives:
+                d_node = self.tree.insert(lib_node, "end",
+                                          text="  📄 설정 (.directives)",
+                                          tags=("directives",))
+                self._node_map[d_node] = ("lib_directives", lb)
+
             # MODEL들
             for model in lb.models:
                 m_node = self.tree.insert(
@@ -434,10 +475,44 @@ class LibEditorApp(tk.Tk):
                 self._node_map[m_node] = ("model", model, lb)
 
         # 트리 태그 색상
-        self.tree.tag_configure("lib",        foreground=FG_ACCENT)
-        self.tree.tag_configure("model",      foreground=FG_GREEN)
-        self.tree.tag_configure("params",     foreground=FG_YELLOW)
-        self.tree.tag_configure("param_var",  foreground=FG_DIM)
+        self.tree.tag_configure("lib",           foreground=FG_ACCENT)
+        self.tree.tag_configure("model",         foreground=FG_GREEN)
+        self.tree.tag_configure("params",        foreground=FG_YELLOW)
+        self.tree.tag_configure("param_var",     foreground=FG_DIM)
+        self.tree.tag_configure("directives",    foreground=FG_PURPLE)
+        self.tree.tag_configure("directive_var", foreground=FG_DIM)
+
+    # ── 트리 더블클릭 (이름 변경) ─────────────────────────
+    def _on_tree_double_click(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        info = self._node_map.get(iid)
+        if not info:
+            return
+            
+        kind = info[0]
+        if kind == "lib":
+            lb = info[1]
+            new_name = simpledialog.askstring("LIB 이름 변경", "새 LIB 이름을 입력하세요:", initialvalue=lb.name, parent=self)
+            if new_name and new_name.strip():
+                lb.name = new_name.strip()
+                self._rebuild_tree()
+                
+        elif kind == "model":
+            model = info[1]
+            dlg = ParamAddDialog(self, title="MODEL 속성 변경")
+            dlg._name_var.set(model.name)
+            dlg._val_var.set(model.model_type)
+            # 재활용 다이얼로그 라벨 변경
+            # dialog는 tk.Toplevel 이므로 show_model_params처럼 변경하려면 별도 클래스가 낫지만 임시로
+            if dlg.result:
+                new_name, new_type = dlg.result
+                model.name = new_name
+                model.model_type = new_type
+                self._rebuild_tree()
+                self._on_tree_select()
 
     # ── 트리 선택 이벤트 ──────────────────────────────────
     def _on_tree_select(self, event=None):
@@ -473,6 +548,17 @@ class LibEditorApp(tk.Tk):
             self._info_var.set(f"📁  LIB: {lb.name}   (MODEL {len(lb.models)}개 / PARAM {len(lb.params)}개)")
             self._clear_param_table()
 
+        elif kind == "global_directives":
+            self._current_node = ("global_directives", None)
+            self._info_var.set("📄  전역 설정 (.directives)")
+            self._show_directive_list(self.lib_file.global_directives)
+
+        elif kind == "lib_directives":
+            lb = info[1]
+            self._current_node = ("lib_directives", lb)
+            self._info_var.set(f"📄  LIB [{lb.name}] – 설정 (.directives)")
+            self._show_directive_list(lb.directives)
+
         else:
             self._clear_param_table()
 
@@ -496,6 +582,18 @@ class LibEditorApp(tk.Tk):
             iid = self.param_tree.insert("", "end",
                                           values=(pe.name, pe.value),
                                           tags=(tag,))
+            self._param_items.append(iid)
+
+    # ── 지시어 목록 표시 (Directive 변수용) ─────────────────
+    def _show_directive_list(self, directive_list: list):
+        self._clear_param_table()
+        self.param_tree.heading("name",  text="키워드")
+        self.param_tree.heading("value", text="전체 지시어 (원문)")
+        for i, de in enumerate(directive_list):
+            base = "odd" if i % 2 == 0 else "even"
+            iid = self.param_tree.insert("", "end",
+                                          values=(de.keyword, de.raw_text),
+                                          tags=(base,))
             self._param_items.append(iid)
 
     def _value_tag(self, value: str, row_idx: int) -> str:
@@ -575,7 +673,15 @@ class LibEditorApp(tk.Tk):
                 if pe.name == old_name:
                     pe.name = new_name
                     break
-
+        elif kind in ("global_directives", "lib_directives"):
+            directive_list = (self.lib_file.global_directives
+                              if kind == "global_directives"
+                              else node[1].directives)
+            for de in directive_list:
+                if de.keyword == old_name:
+                    de.keyword = new_name
+                    break
+                    
     def _update_param_value(self, param_name: str, new_value: str):
         node = self._current_node
         if not node:
@@ -592,6 +698,14 @@ class LibEditorApp(tk.Tk):
             for pe in param_list:
                 if pe.name == param_name:
                     pe.value = new_value
+                    break
+        elif kind in ("global_directives", "lib_directives"):
+            directive_list = (self.lib_file.global_directives
+                              if kind == "global_directives"
+                              else node[1].directives)
+            for de in directive_list:
+                if de.keyword == param_name:
+                    de.raw_text = new_value
                     break
 
     # ── 파라미터 추가 ─────────────────────────────────────
@@ -633,6 +747,23 @@ class LibEditorApp(tk.Tk):
                 self._param_items.append(iid)
                 self.param_tree.see(iid)
                 # 트리 업데이트
+                self._rebuild_tree()
+
+        elif kind in ("global_directives", "lib_directives"):
+            directive_list = (self.lib_file.global_directives
+                              if kind == "global_directives"
+                              else node[1].directives)
+            dlg = ParamAddDialog(self, title="지시어(Directive) 추가")
+            if dlg.result:
+                keyw, text = dlg.result
+                directive_list.append(DirectiveEntry(keyword=keyw, raw_text=text))
+                row_idx = len(self._param_items)
+                base = "odd" if row_idx % 2 == 0 else "even"
+                iid = self.param_tree.insert("", "end",
+                                              values=(keyw, text),
+                                              tags=(base,))
+                self._param_items.append(iid)
+                self.param_tree.see(iid)
                 self._rebuild_tree()
 
         elif kind == "lib":
@@ -680,45 +811,83 @@ class LibEditorApp(tk.Tk):
                     break
             self._rebuild_tree()
 
+        elif kind in ("global_directives", "lib_directives"):
+            directive_list = (self.lib_file.global_directives
+                              if kind == "global_directives"
+                              else node[1].directives)
+            for i, de in enumerate(directive_list):
+                if de.keyword == param_name:
+                    directive_list.pop(i)
+                    break
+            self._rebuild_tree()
+
         self.param_tree.delete(item_id)
         if item_id in self._param_items:
             self._param_items.remove(item_id)
 
-    # ── 변수 할당 대화상자 ────────────────────────────────
-    def _assign_variable(self):
-        """
-        선택된 파라미터 값을 변수 참조({var_name})로 바꾸거나,
-        새 PARAM 변수를 만들고 연결합니다.
-        """
-        sel = self.param_tree.selection()
-        if not sel:
-            messagebox.showwarning("선택 필요", "변수로 대체할 파라미터를 먼저 선택하세요.")
+    # ── 일괄 수정 / 엑셀 내보내기 ──────────────────────────
+    def _export_excel(self):
+        if not self.lib_file:
+            messagebox.showwarning("경고", "열린 파일이 없습니다.")
             return
-        item_id = sel[0]
-        values = self.param_tree.item(item_id, "values")
-        if not values:
+            
+        default_name = os.path.splitext(os.path.basename(self.lib_file.filepath))[0] + "_export.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Excel로 내보내기",
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel 파일", "*.xlsx")],
+        )
+        if not path:
             return
-        param_name, current_val = values[0], values[1]
+            
+        try:
+            export_lib_to_excel(self.lib_file, path)
+            messagebox.showinfo("내보내기 완료", f"Excel 생성 완료:\n{path}")
+        except Exception as e:
+            messagebox.showerror("오류", f"Excel 내보내기 실패:\n{e}")
 
-        dlg = VariableAssignDialog(self, param_name=param_name,
-                                    current_value=current_val,
-                                    lib_file=self.lib_file)
+    def _batch_edit_param(self):
+        """
+        일괄 수정(Batch Edit) 다이얼로그를 띄워 특정 이름을 가진 파라미터 값 전체를 변경합니다.
+        범위(전체 또는 현재 선택된 LIB 블록 내)를 선택할 수 있으며,
+        순회하면서 일치하는 파라미터가 있을 경우 지정한 새 값으로 모두 교체합니다.
+        """
+        if not self.lib_file:
+            return
+            
+        dlg = BatchEditDialog(self, self.lib_file, getattr(self, '_current_node', None))
         if dlg.result:
-            var_name, var_val, expr = dlg.result
-            # 1) PARAM 추가 (전역)
-            existing = [p.name for p in self.lib_file.global_params]
-            if var_name not in existing:
-                self.lib_file.global_params.append(
-                    ParamEntry(name=var_name, value=var_val)
-                )
-            # 2) 파라미터 값을 수식으로 변경
-            new_val = expr  # 예: {my_var} 또는 {my_var * 1.1}
-            self._update_param_value(param_name, new_val)
-            self.param_tree.set(item_id, "#2", new_val)
-            row_idx = self.param_tree.index(item_id)
-            tag = self._value_tag(new_val, row_idx)
-            self.param_tree.item(item_id, tags=(tag,))
-            self._rebuild_tree()
+            p_name, p_value, scope = dlg.result
+            count = 0
+            
+            blocks = []
+            if scope == "all":
+                blocks = self.lib_file.lib_blocks
+            elif scope == "lib" and self._current_node and self._current_node[0] in ("lib", "model", "lib_params", "lib_directives"):
+                # find which lib is selected
+                lb = self._current_node[1] if self._current_node[0] != "model" else self._current_node[2]
+                blocks = [lb]
+            else:
+                blocks = self.lib_file.lib_blocks
+                
+            for lb in blocks:
+                for model in lb.models:
+                    if p_name in model.params:
+                        model.params[p_name] = p_value
+                        count += 1
+                        
+            messagebox.showinfo("적용 완료", f"총 {count}개의 모델에서 '{p_name}' 값이 변경되었습니다.")
+            
+            # 뷰 갱신
+            if self._current_node:
+                self._on_tree_select()
+
+    def _open_param_view(self):
+        if not self.lib_file:
+            messagebox.showwarning("경고", "열린 파일이 없습니다.")
+            return
+        ParameterViewWindow(self, self.lib_file)
 
 
 # ─────────────────────── 다이얼로그 ──────────────────────
@@ -791,22 +960,22 @@ class ParamAddDialog(tk.Toplevel):
         self.destroy()
 
 
-class VariableAssignDialog(tk.Toplevel):
-    """파라미터 값을 변수 참조로 변환하는 다이얼로그"""
+class BatchEditDialog(tk.Toplevel):
+    """일괄 파라미터 수정 다이얼로그"""
 
-    def __init__(self, parent, param_name, current_value, lib_file: LibFile):
+    def __init__(self, parent, lib_file: LibFile, current_node):
         super().__init__(parent)
-        self.title("변수 할당")
+        self.title("일괄 파라미터 수정")
         self.result = None
         self.resizable(False, False)
         self.configure(bg=BG_DARK)
         self.grab_set()
         self.transient(parent)
-        self._build(param_name, current_value, lib_file)
+        self._build(lib_file, current_node)
         self.wait_window()
 
-    def _build(self, param_name, current_value, lib_file):
-        tk.Label(self, text=f"변수 할당: [{param_name}]",
+    def _build(self, lib_file: LibFile, current_node):
+        tk.Label(self, text="일괄 파라미터 수정",
                  bg=BG_HEADER, fg=FG_ACCENT,
                  font=FONT_TITLE, anchor="w", padx=14, pady=8
                  ).pack(fill=tk.X)
@@ -814,48 +983,41 @@ class VariableAssignDialog(tk.Toplevel):
         frm = tk.Frame(self, bg=BG_DARK, padx=20, pady=16)
         frm.pack(fill=tk.BOTH)
 
-        # 기존 변수 목록
-        all_vars = lib_file.all_params()
-        var_names = [p.name for p in all_vars]
+        # 파라미터 목록 수집 (전체)
+        all_params = set()
+        for lb in lib_file.lib_blocks:
+            for model in lb.models:
+                all_params.update(model.params.keys())
+        p_names = sorted(list(all_params))
 
-        tk.Label(frm, text="변수 이름:", bg=BG_DARK, fg=FG_MAIN,
+        tk.Label(frm, text="대상 파라미터:", bg=BG_DARK, fg=FG_MAIN,
                  font=FONT_BODY).grid(row=0, column=0, sticky="w", pady=6)
-        self._var_name = tk.StringVar()
-        var_combo = ttk.Combobox(frm, textvariable=self._var_name,
-                                 values=var_names, width=26, font=FONT_BODY)
+        self._p_name = tk.StringVar()
+        var_combo = ttk.Combobox(frm, textvariable=self._p_name,
+                                 values=p_names, width=26, font=FONT_BODY)
         var_combo.grid(row=0, column=1, pady=6, padx=(8, 0))
 
-        tk.Label(frm, text="변수 값:", bg=BG_DARK, fg=FG_MAIN,
+        tk.Label(frm, text="새 파라미터 값:", bg=BG_DARK, fg=FG_MAIN,
                  font=FONT_BODY).grid(row=1, column=0, sticky="w", pady=6)
-        self._var_val = tk.StringVar(value=current_value)
-        tk.Entry(frm, textvariable=self._var_val,
+        self._p_val = tk.StringVar()
+        tk.Entry(frm, textvariable=self._p_val,
                  bg=BG_PANEL, fg=FG_MAIN, insertbackground=FG_MAIN,
                  font=FONT_BODY, relief="flat",
                  highlightthickness=1, highlightcolor=FG_ACCENT,
                  highlightbackground=BORDER, width=28
                  ).grid(row=1, column=1, pady=6, padx=(8, 0))
 
-        tk.Label(frm, text="수식 (파라미터 값으로 들어갈 표현):",
+        tk.Label(frm, text="적용 범위:",
                  bg=BG_DARK, fg=FG_MAIN, font=FONT_BODY
                  ).grid(row=2, column=0, sticky="w", pady=6)
-        self._expr_var = tk.StringVar()
-        expr_entry = tk.Entry(frm, textvariable=self._expr_var,
-                              bg=BG_PANEL, fg=FG_MAIN, insertbackground=FG_MAIN,
-                              font=FONT_BODY, relief="flat",
-                              highlightthickness=1, highlightcolor=FG_ACCENT,
-                              highlightbackground=BORDER, width=28)
-        expr_entry.grid(row=2, column=1, pady=6, padx=(8, 0))
-
-        def _update_expr(*_):
-            vn = self._var_name.get().strip()
-            if vn:
-                self._expr_var.set(f"{{{vn}}}")
-        self._var_name.trace_add("write", _update_expr)
-
-        tk.Label(frm,
-                 text="예시: {my_var}  또는  {my_var * 1.1}  또는  {my_var + offset}",
-                 bg=BG_DARK, fg=FG_DIM, font=FONT_SMALL
-                 ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
+                 
+        self._scope_var = tk.StringVar(value="all")
+        rb_frm = tk.Frame(frm, bg=BG_DARK)
+        rb_frm.grid(row=2, column=1, sticky="w", pady=6, padx=(8,0))
+        tk.Radiobutton(rb_frm, text="모든 LIB", variable=self._scope_var, value="all",
+                       bg=BG_DARK, fg=FG_MAIN, selectcolor=BG_PANEL, font=FONT_BODY).pack(side=tk.LEFT)
+        tk.Radiobutton(rb_frm, text="현재 보고있는 LIB", variable=self._scope_var, value="lib",
+                       bg=BG_DARK, fg=FG_MAIN, selectcolor=BG_PANEL, font=FONT_BODY).pack(side=tk.LEFT)
 
         btn_frm = tk.Frame(self, bg=BG_DARK, pady=10)
         btn_frm.pack()
@@ -868,16 +1030,102 @@ class VariableAssignDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
     def _ok(self):
-        var_name = self._var_name.get().strip()
-        var_val  = self._var_val.get().strip()
-        expr     = self._expr_var.get().strip()
-        if not var_name:
-            messagebox.showwarning("입력 오류", "변수 이름을 입력하세요.", parent=self)
+        p_name = self._p_name.get().strip()
+        p_val  = self._p_val.get().strip()
+        scope  = self._scope_var.get()
+        if not p_name:
+            messagebox.showwarning("입력 오류", "이름을 입력하세요.", parent=self)
             return
-        if not expr:
-            expr = f"{{{var_name}}}"
-        self.result = (var_name, var_val, expr)
+        self.result = (p_name, p_val, scope)
         self.destroy()
+
+class ParameterViewWindow(tk.Toplevel):
+    """선택한 파라미터에 대해 모델별 값을 보여주는 창"""
+
+    def __init__(self, parent, lib_file: LibFile):
+        super().__init__(parent)
+        self.title("파라미터 중심 뷰")
+        self.geometry("900x600")
+        self.configure(bg=BG_DARK)
+        self.lib_file = lib_file
+
+        self._build()
+
+    def _build(self):
+        pw = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BORDER, sashwidth=4, sashrelief="flat")
+        pw.pack(fill=tk.BOTH, expand=True)
+
+        # ── 좌측: 파라미터 목록 ──
+        left = tk.Frame(pw, bg=BG_PANEL, width=250)
+        pw.add(left, minsize=150)
+        
+        tk.Label(left, text="파라미터 목록", bg=BG_HEADER, fg=FG_ACCENT, font=FONT_TITLE, anchor="w", padx=12, pady=8).pack(fill=tk.X)
+
+        tframe = tk.Frame(left, bg=BG_PANEL)
+        tframe.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        vsb1 = ttk.Scrollbar(tframe, orient=tk.VERTICAL)
+        vsb1.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.p_tree = ttk.Treeview(tframe, style="Tree.Treeview", show="tree", yscrollcommand=vsb1.set)
+        self.p_tree.pack(fill=tk.BOTH, expand=True)
+        vsb1.config(command=self.p_tree.yview)
+        self.p_tree.bind("<<TreeviewSelect>>", self._on_p_select)
+
+        # ── 우측: 모델별 값 목록 ──
+        right = tk.Frame(pw, bg=BG_DARK)
+        pw.add(right, minsize=400)
+        
+        self._title_var = tk.StringVar(value="← 파라미터를 선택하세요")
+        tk.Label(right, textvariable=self._title_var, bg=BG_HEADER, fg=FG_ACCENT, font=FONT_TITLE, anchor="w", padx=14, pady=8).pack(fill=tk.X)
+
+        rframe = tk.Frame(right, bg=BG_DARK)
+        rframe.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        vsb2 = ttk.Scrollbar(rframe, orient=tk.VERTICAL)
+        vsb2.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.v_tree = ttk.Treeview(rframe, style="Param.Treeview", columns=("lib", "model", "val"), show="headings", yscrollcommand=vsb2.set)
+        self.v_tree.heading("lib", text="LIB명", anchor="w")
+        self.v_tree.heading("model", text="MODEL명", anchor="w")
+        self.v_tree.heading("val", text="값", anchor="w")
+        self.v_tree.column("lib", width=200, anchor="w")
+        self.v_tree.column("model", width=200, anchor="w")
+        self.v_tree.column("val", width=200, anchor="w")
+        
+        self.v_tree.tag_configure("odd",  background=BG_ROW_ODD)
+        self.v_tree.tag_configure("even", background=BG_ROW_EVN)
+        
+        self.v_tree.pack(fill=tk.BOTH, expand=True)
+        vsb2.config(command=self.v_tree.yview)
+
+        self._populate_params()
+
+    def _populate_params(self):
+        all_params = set()
+        for lb in self.lib_file.lib_blocks:
+            for model in lb.models:
+                all_params.update(model.params.keys())
+                
+        for p in sorted(list(all_params)):
+            self.p_tree.insert("", "end", text=f"  {p}", iid=p)
+
+    def _on_p_select(self, event=None):
+        sel = self.p_tree.selection()
+        if not sel: return
+        p_name = sel[0]
+        
+        for iid in self.v_tree.get_children():
+            self.v_tree.delete(iid)
+            
+        self._title_var.set(f"파라미터: {p_name}")
+        
+        row_idx = 0
+        for lb in self.lib_file.lib_blocks:
+            for model in lb.models:
+                if p_name in model.params:
+                    val = model.params[p_name]
+                    tag = "odd" if row_idx % 2 == 0 else "even"
+                    self.v_tree.insert("", "end", values=(lb.name, model.name, val), tags=(tag,))
+                    row_idx += 1
 
 
 # ─────────────────────── 진입점 ──────────────────────────
